@@ -1,0 +1,37 @@
+# ─── Simulation build artefacts ───────────────────────────────────────────────
+# Compiled Icarus Verilog binaries
+attention_hardware/sim/*_sim
+attention_hardware/sim/top_sim
+attention_hardware/sim/softmax_tb
+
+# VCD waveform dump (can be large; regenerate with: make run)
+attention_hardware/sim/*.vcd
+
+# Simulation output (regenerate with: make run)
+attention_hardware/data/output.txt
+
+# ─── Python ───────────────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*.pyo
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# ─── Editor / tooling ─────────────────────────────────────────────────────────
+.claude/
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# ─── OS ───────────────────────────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+desktop.ini
