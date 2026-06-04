@@ -7,7 +7,6 @@ This document is the long-form companion to [`README.md`](README.md). It covers:
 3. [Softmax design justification](#3-softmax-design-justification) — why LUT-based, error budget.
 4. [Cycle-latency analysis](#4-cycle-latency-analysis) — per-stage cost.
 5. [Trade-off matrix](#5-trade-off-matrix) — choices that were made and what they cost.
-6. [Future work](#6-future-work) — what the next iteration would add.
 
 ---
 
@@ -198,14 +197,4 @@ None of these change the observable output — they're area/throughput trades.
 | Parameterisation | `N`, `D`, `LUT_DEPTH` flow through every module | Hard-code N=3 (was the previous state) | Demonstrates we understand the scaling story; lets `gen_luts.py --n N` regenerate everything consistently. |
 | Verification | Self-checking RTL TB **+** fp32 NumPy ref | Either alone | Two independent checks catch different bugs: TB catches RTL regressions, `validate.py` catches Q-format drift. |
 
----
 
-## 6. Future work
-
-- **Pipeline the FSM stages.** PROJ → SCORE → OUTPUT can overlap on streaming inputs once the per-stage handshake is replaced with valid/ready. Expected 3–4× throughput.
-- **Multi-head attention.** Replicate the pipeline and add a head-concat at the output stage. Q,K,V already factor naturally.
-- **Causal masking.** Add a triangular mask between `score_unit` and `scale_unit` — one extra register file, no FSM change.
-- **Wider `A` (Q.10 or Q.12).** Halves the quantization-floor error reported in §3 at the cost of a wider `output_unit` multiplier.
-- **Replace LUT with CORDIC `exp`** if `N` grows beyond a few hundred (LUT cost scales linearly with the post-max-subtract range).
-- **Auto-clear the top-level `done` flag** so the block is re-runnable without an external reset — single line of FSM logic but worth doing for any real integration.
-- **Add formal property checks** (e.g. SystemVerilog assertions) on the `done` handshake invariants between FSM stages.
