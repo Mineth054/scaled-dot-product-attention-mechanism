@@ -16,44 +16,8 @@ NumPy reference. Max error vs floating-point: **0.0049**.
 
 Five pipeline stages orchestrated by a top-level FSM:
 
-```
-Input Files
-(X, WQ, WK, WV)
-      │
-      ▼
-┌─────────────────────────────────────┐
-│         Projection Unit             │
-│  Q = X·WQ  │  K = X·WK  │  V = X·WV│
-│     (3 matrix multiplies, parallel) │
-└────┬──────────────┬──────────┬──────┘
-     │ Q            │ K        │ V (bypasses to output)
-     └──────┬───────┘          │
-            ▼                  │
-      ┌──────────────┐         │
-      │  Score Unit  │         │
-      │  S = Q · Kᵀ  │         │
-      └──────┬───────┘         │
-             ▼                 │
-      ┌──────────────┐         │
-      │  Scale Unit  │         │
-      │  S >>> 1     │         │
-      └──────┬───────┘         │
-             ▼                 │
-      ┌──────────────┐         │
-      │Softmax Unit  │         │
-      │ exp LUT +    │         │
-      │ recip LUT    │         │
-      └──────┬───────┘         │
-             │ A               │
-             └────────┬────────┘
-                      ▼
-               ┌────────────┐
-               │Output Unit │──► output.txt
-               │  O = A · V │
-               └────────────┘
-```
+<img width="1169" height="1600" alt="WhatsApp Image 2026-06-08 at 14 57 20" src="https://github.com/user-attachments/assets/71a3cdb4-2031-457e-9338-b704db2f0075" />
 
----
 
 ## Fixed-Point Format Chain
 
