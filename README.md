@@ -58,6 +58,8 @@ Testbench ($readmemh)
                └────────────┘
 ```
 
+<img width="1169" height="1600" alt="Architecture diagram" src="https://github.com/user-attachments/assets/71a3cdb4-2031-457e-9338-b704db2f0075" />
+
 The matmul-style units implement **two datapaths**, selected by the `PARALLEL`
 parameter: sequential (one MAC, area-minimal) and parallel (one full dot
 product per cycle through an adder tree). Measured at N=3, D=4:
