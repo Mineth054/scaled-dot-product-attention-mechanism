@@ -10,7 +10,7 @@
 #   make test       -- build + run + validate (single end-to-end check)
 #   make wave       -- open sim/attention.vcd in gtkwave (Linux/Mac/WSL)
 #   make luts       -- regenerate data/recip_lut.txt + data/O_expected.txt
-#   make <mod>_sim  -- per-module simulator (mac_sim, mul_sim, mm_sim, ...)
+#   make <mod>_sim  -- per-module simulator (mm_sim, proj_sim, ...)
 #   make clean      -- remove sim binaries, VCD, generated output
 #
 # Tested with iverilog 12.0, Python 3.12+.
@@ -20,6 +20,8 @@ IVERILOG ?= iverilog
 VVP      ?= vvp
 PYTHON   ?= python
 GTKWAVE  ?= gtkwave
+SV2V     ?= sv2v
+YOSYS    ?= yowasp-yosys
 
 IVFLAGS  ?= -g2012
 
@@ -34,8 +36,8 @@ OUTPUT    := $(DATADIR)/output.txt
 EXPECTED  := $(DATADIR)/O_expected.txt
 RECIP_LUT := $(DATADIR)/recip_lut.txt
 
-.PHONY: all test build run validate wave luts clean help \
-        mac_sim mul_sim mm_sim proj_sim score_sim scale_sim softmax_sim out_sim
+.PHONY: all test build run validate wave luts regress synth synth_par clean help \
+        mm_sim proj_sim score_sim scale_sim softmax_sim out_sim
 
 all: test
 
@@ -57,6 +59,20 @@ validate: $(OUTPUT)
 wave: $(VCD)
 	$(GTKWAVE) $(VCD) &
 
+# ─── randomized regression (RTL vs bit-accurate model) ───
+regress:
+	$(PYTHON) scripts/regress.py --runs 20 --range 3
+	$(PYTHON) scripts/regress.py --runs 20 --range 3 --parallel
+
+# ─── synthesis (sv2v -> Yosys; reports cell counts + logic depth) ───
+synth: | $(SIMDIR)
+	$(SV2V) $(SRC) > $(SIMDIR)/design_flat.v
+	$(YOSYS) -p "read_verilog $(SIMDIR)/design_flat.v; synth -top top_level -flatten; stat; ltp -noff"
+
+synth_par: | $(SIMDIR)
+	$(SV2V) $(SRC) > $(SIMDIR)/design_flat.v
+	$(YOSYS) -p "read_verilog $(SIMDIR)/design_flat.v; chparam -set PARALLEL 1 top_level; synth -top top_level -flatten; stat; ltp -noff"
+
 # ─── LUTs + golden vector ───
 luts: $(RECIP_LUT) $(EXPECTED)
 
@@ -67,14 +83,12 @@ $(EXPECTED): scripts/gen_golden.py $(DATADIR)/X.txt $(DATADIR)/WQ.txt $(DATADIR)
 	$(PYTHON) scripts/gen_golden.py
 
 # ─── per-module sims ───
-mac_sim:     ; $(IVERILOG) $(IVFLAGS) -o $(SIMDIR)/mac_sim     src/multiplier.v src/mac_unit.v tb/mac_unit_tb.v && $(VVP) $(SIMDIR)/mac_sim
-mul_sim:     ; $(IVERILOG) $(IVFLAGS) -o $(SIMDIR)/mul_sim     src/multiplier.v tb/multiplier_tb.v && $(VVP) $(SIMDIR)/mul_sim
 mm_sim:      ; $(IVERILOG) $(IVFLAGS) -o $(SIMDIR)/mm_sim      src/matrix_multiply.v tb/matrix_multiply_tb.v && $(VVP) $(SIMDIR)/mm_sim
 proj_sim:    ; $(IVERILOG) $(IVFLAGS) -o $(SIMDIR)/proj_sim    src/matrix_multiply.v src/projection_unit.v tb/projection_unit_tb.v && $(VVP) $(SIMDIR)/proj_sim
 score_sim:   ; $(IVERILOG) $(IVFLAGS) -o $(SIMDIR)/score_sim   src/score_unit.v tb/score_unit_tb.v && $(VVP) $(SIMDIR)/score_sim
 scale_sim:   ; $(IVERILOG) $(IVFLAGS) -o $(SIMDIR)/scale_sim   src/scale_unit.v tb/scale_unit_tb.v && $(VVP) $(SIMDIR)/scale_sim
-softmax_sim: ; $(IVERILOG) $(IVFLAGS) -o $(SIMDIR)/softmax_sim src/softmax_unit.v src/unsigned_multiplier.v tb/softmax_unit_tb.v && $(VVP) $(SIMDIR)/softmax_sim
-out_sim:     ; $(IVERILOG) $(IVFLAGS) -o $(SIMDIR)/out_sim     src/multiplier.v src/output_unit.v tb/output_unit_tb.v && $(VVP) $(SIMDIR)/out_sim
+softmax_sim: ; $(IVERILOG) $(IVFLAGS) -o $(SIMDIR)/softmax_sim src/softmax_unit.v tb/softmax_unit_tb.v && $(VVP) $(SIMDIR)/softmax_sim
+out_sim:     ; $(IVERILOG) $(IVFLAGS) -o $(SIMDIR)/out_sim     src/output_unit.v tb/output_unit_tb.v && $(VVP) $(SIMDIR)/out_sim
 
 # ─── housekeeping ───
 $(SIMDIR):
@@ -84,5 +98,5 @@ clean:
 	rm -f $(SIMDIR)/*_sim $(SIMDIR)/top_sim $(VCD) $(OUTPUT)
 
 help:
-	@echo "Targets: test (default) | build | run | validate | wave | luts | clean"
-	@echo "Per-module: mac_sim mul_sim mm_sim proj_sim score_sim scale_sim softmax_sim out_sim"
+	@echo "Targets: test (default) | build | run | validate | wave | luts | regress | synth | synth_par | clean"
+	@echo "Per-module: mm_sim proj_sim score_sim scale_sim softmax_sim out_sim"

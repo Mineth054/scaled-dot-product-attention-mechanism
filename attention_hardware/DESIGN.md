@@ -4,9 +4,10 @@ This document is the long-form companion to [`README.md`](README.md). It covers:
 
 1. [A fully worked numerical example](#1-worked-numerical-example) — one row of attention by hand, end-to-end.
 2. [The fixed-point format chain](#2-fixed-point-format-chain) — Q-format at every signal.
-3. [Softmax design justification](#3-softmax-design-justification) — why LUT-based, error budget.
-4. [Cycle-latency analysis](#4-cycle-latency-analysis) — per-stage cost.
-5. [Trade-off matrix](#5-trade-off-matrix) — choices that were made and what they cost.
+3. [Softmax design justification](#3-softmax-design-justification) — two-LUT exp, reciprocal divide, error budget.
+4. [Cycle-latency analysis](#4-cycle-latency-analysis) — sequential vs parallel datapath, measured.
+5. [Synthesis results](#5-synthesis-results) — Yosys cell counts and logic depth for both datapaths.
+6. [Trade-off matrix](#6-trade-off-matrix) — choices that were made and what they cost.
 
 ---
 
@@ -42,10 +43,13 @@ S[0][1] = Q[0]·K[1] = [2,0,0,0]·[2,0,0,0] = 4
 S[0][2] = Q[0]·K[2] = [2,0,0,0]·[1,1,1,1] = 2
 ```
 
-### Scale (scale_unit, `>>> 1` for √dₖ = √4 = 2)
+### Scale (scale_unit)
+
+`S_scaled = round(S · 2⁴ / √D)` in Q27.4, computed as `(S · RECIP + 128) >>> 8`
+with `RECIP = round(2¹² / √D) = 2048` for `D = 4` (exact, since √4 is a power of two):
 
 ```
-S_scaled[0] = [0, 2, 1]
+S_scaled[0] = [0, 32, 16]     // Q27.4 raw = real values [0, 2.0, 1.0]
 ```
 
 ### Softmax — Python reference
@@ -58,59 +62,61 @@ sum              = 1.5032
 softmax          = [0.0900, 0.6652, 0.2447]
 ```
 
-### Softmax — Hardware (the LUT pipeline)
+### Softmax — Hardware (the two-LUT pipeline)
 
 ```
-diff            = [-2, 0, -1]
-−diff           = [ 2, 0, 1]                  // indices into exp_lut
-exp_lut         = [139, 1024, 377]            // Q6.10
-row_sum         = 1540                        // 12-bit, exact (max would be 3072 at N=3)
-recip_lut[1540] = floor(2^20 / 1540) = 680    // Q.20 effective
+diff (Q27.4 raw) = [-32, 0, -16]
+−diff            = [ 32, 0,  16]
+integer part i   = −diff >> 4 = [2, 0, 1]      // index into exp_int_lut
+fraction f       = −diff & 15 = [0, 0, 0]      // index into exp_frac_lut
 
-A[0][0] = 139  · 680 = 94 520   → bits[27:12] = 23
-A[0][1] = 1024 · 680 = 696 320  → bits[27:12] = 170
-A[0][2] = 377  · 680 = 256 360  → bits[27:12] = 62
+exp = (exp_int_lut[i] · exp_frac_lut[f] + 512) >> 10     // Q1.10 · Q1.10 → Q1.10
+    = [139, 1024, 377]
 
-Recovered as fractions: A[0] / 256 = [0.0898, 0.6641, 0.2422]
+row_sum          = 1540                        // Q.10, max N·1024 = 3072
+recip_lut[1540]  = floor(2²⁰ / 1540) = 680
+
+A[0][0] = (139  · 680 + 2048) >> 12 = 23
+A[0][1] = (1024 · 680 + 2048) >> 12 = 170
+A[0][2] = (377  · 680 + 2048) >> 12 = 63
+
+Recovered as fractions: A[0] / 256 = [0.0898, 0.6641, 0.2461]
 ```
 
-Side-by-side error: Python = `[0.0900, 0.6652, 0.2447]`, hardware = `[0.0898, 0.6641, 0.2422]`. Max absolute error = 0.0025 — under the ÷256 rounding granularity (0.0039), so this is at the quantization floor.
+Side-by-side error: Python = `[0.0900, 0.6652, 0.2447]`, hardware = `[0.0898, 0.6641, 0.2461]`. Max absolute error = 0.0014 — under the ÷256 rounding granularity (0.0039), i.e. at the quantization floor of the A representation.
 
 ### Output (output_unit)
 
 ```
 O[0] = A[0][0]·V[0] + A[0][1]·V[1] + A[0][2]·V[2]
-     =  23·[2,0,0,0] + 170·[0,2,0,0] + 62·[1,1,1,1]
-     = [46,   0,  0,  0]
-     + [ 0, 340,  0,  0]
-     + [62,  62, 62, 62]
-     = [108, 402, 62, 62]
+     =  23·[2,0,0,0] + 170·[0,2,0,0] + 63·[1,1,1,1]
+     = [109, 403, 63, 63]
 ```
 
-This is exactly what the hardware writes to `data/output.txt` row 0 and what the self-checking testbench compares against the golden `[109, 403, 63, 63]` (Python fp32 × 256, rounded) with `diff = 1`.
+The fp32 golden (Python × 256, rounded) is `[109, 403, 63, 63]` — the hardware row is **bit-identical** on this vector.
 
 ---
 
 ## 2. Fixed-point format chain
 
-Every signal carries an implicit Q-format. The interview will probe this.
+Every signal carries an implicit Q-format.
 
 | Signal | Width | Format | Reasoning |
 |---|---|---|---|
 | `X`, `WQ/K/V` | signed 8 | Q7.0 | INT8-style weights/embeddings; matches common ML quantization targets. |
-| `Q, K, V` | signed 16 | Q15.0 | Dot product over `D=4` of 8-bit × 8-bit. Worst case 4·127² = 64 516 → 17 bits; we trust real magnitudes are smaller. Headroom is intentionally tight to keep accumulators in a single 16-bit word. |
-| `S` (scores) | signed 32 | Q31.0 | 16-bit × 16-bit · D = up to 34 bits in the absolute worst case. 32 bits is a deliberate trade — we trust upstream magnitudes from real Q/K weights are well below worst case. |
-| `S_scaled` | signed 16 | Q15.0 | `S >>> 1`. Drops one LSB; for `dₖ=4` this is exact. |
-| `diff = S_scaled − row_max` | signed 16 | Q15.0, always ≤ 0 | Numerical-stability subtraction; clamped at `−(LUT_DEPTH−1)`. |
-| `exp_lut[d]` | unsigned 16 | **Q6.10** (e⁻ᵈ · 2¹⁰) | Max value 1024 = 1.0. 10 fractional bits give ~0.001 resolution — finer than any tail entry needs. |
-| `row_sum` | unsigned `⌈log₂(N·1024+1)⌉` | Q.10 (carries the 2¹⁰ scale from exp) | At N=3: 12 bits, max 3072. Bound also indexes the reciprocal LUT directly. |
-| `recip_lut[s]` | unsigned 32 | `floor(2²⁰ / s)` | Effective: when multiplied by `exp_val` (which carries 2¹⁰), the 2¹⁰ in `row_sum` cancels, leaving `prob · 2²⁰`. |
-| `mul_result = exp_val · recip` | unsigned 48 | prob · 2²⁰ | `(e^d · 2¹⁰) · (2¹⁰ / Σe^d) = prob · 2²⁰` after the implicit 2¹⁰ cancellation. |
-| `A[i][j] = mul_result[27:12]` | unsigned 16 | **Q.8** (prob · 256) | `prob · 2²⁰ >> 12 = prob · 2⁸`. 16-bit container easily holds the full 0..256 range. |
-| `O[i][j]` | signed 32 | Q31.0 (carries A's ×256 scale) | `Σ A · V`. Max: 3 · 256 · 127 ≈ 97 k, fits in 17 bits; 32 bits gives wide headroom. |
-| `data/output.txt` integers | — | × 256 of true output | `validate.py` divides by 256 to compare against fp32 reference. |
+| `Q, K, V` | signed 16 | Q15.0 | Dot product over `D` of 8-bit × 8-bit terms. Provably overflow-free for inputs in `[-16, 15]` up to `D=8` (max `8·16·16 = 2048`); full-range INT8 inputs rely on realistic magnitudes (documented input contract). |
+| `S` (scores) | signed 32 | Q31.0 | 16-bit × 16-bit · D; overflow-free for the same input contract (max `8·2048² ≈ 2²⁵`). |
+| `S_scaled` | signed 32 | **Q27.4** | `round(S·2⁴/√D)` via `RECIP = round(2¹²/√D)` then `>>> 8` with rounding. 4 fractional bits give the softmax 1/16-resolution exponents. 32-bit so no realistic score can overflow it. |
+| `diff = S_scaled − row_max` | signed 32 | Q27.4, always ≤ 0 | Numerical-stability subtraction; integer part clamps at `LUT_DEPTH−1 = 15`. |
+| `exp_int_lut[i]` | unsigned 16 | Q1.10 (`e⁻ⁱ`·2¹⁰) | 16 entries, `i ∈ [0,15]`. `e⁻¹⁵ ≈ 3·10⁻⁷` is below the Q.10 LSB, so the clamp loses nothing. |
+| `exp_frac_lut[f]` | unsigned 16 | Q1.10 (`e^(−f/16)`·2¹⁰) | 16 entries covering one integer step; combined as `e^−(i+f) = e⁻ⁱ·e⁻ᶠ`. |
+| `exp = (int·frac + 2⁹) >> 10` | unsigned 16 | Q1.10 | Rounded product of the two LUT reads; max 1024 = 1.0. |
+| `row_sum` | unsigned `⌈log₂(N·1024+1)⌉` | Q.10 | At N=3: 12 bits, max 3072. Directly indexes the reciprocal LUT. |
+| `recip_lut[s]` | unsigned 32 | `floor(2²⁰ / s)` | The 2¹⁰ in `row_sum` cancels the 2¹⁰ carried by `exp`. |
+| `A = (exp·recip + 2¹¹) >> 12` | unsigned 16 | **Q.8** (prob·256) | `prob·2²⁰` rounded down to `prob·2⁸`. |
+| `O` | signed 32 | Q31.0 (carries A's ×256 scale) | `Σ A·V`; `validate.py` divides by 256. |
 
-The trickiest derivation is the `[27:12]` bit-slice in `softmax_unit`; the Verilog header comment in [`src/softmax_unit.v`](src/softmax_unit.v) carries the same algebra inline.
+The input contract (`|X|, |W| ≤ 16` for guaranteed-exact arithmetic at `D ≤ 8`) is exercised directly: `scripts/regress.py` drives random vectors at the contract boundary and checks the RTL against the bit-accurate model for exact equality.
 
 ---
 
@@ -118,83 +124,102 @@ The trickiest derivation is the `[27:12]` bit-slice in `softmax_unit`; the Veril
 
 ### Why LUT-based?
 
-Two reasons:
-
-1. **`exp` is transcendental.** Implementing a true `exp` in hardware is several DSPs + iterative methods (CORDIC, Taylor + range reduction). A small ROM is a few hundred FFs, no DSPs.
-2. **Division is expensive.** Building a divider for 32-bit operands costs a multi-cycle SRT/Newton-Raphson core or a large LUT. A pre-computed reciprocal LUT trades BRAM for a single multiply — which we already have from the existing `unsigned_multiplier`.
+1. **`exp` is transcendental.** A true `exp` in hardware costs CORDIC or polynomial evaluation (multiple multipliers + control). Two 16-entry ROMs and one multiply are far smaller at this size.
+2. **Division is expensive.** A 32-bit divider is a multi-cycle SRT/Newton-Raphson core. A pre-computed reciprocal ROM trades memory for a single multiply.
 
 ### Why subtract the row max first?
 
-Exact same trick `numpy.softmax` uses: shifting the input so the maximum is 0 prevents `exp(large positive)` overflow. In hardware this also means **the exp LUT only needs to cover negative inputs** — we get a factor-of-2 LUT-depth saving for free.
+The same trick `numpy` uses: shifting the input so the maximum is 0 prevents `exp(positive)` overflow. In hardware it also means **the exp path only needs negative inputs** — halving the LUT coverage requirement for free.
 
-### How the LUT is dimensioned
+### Why two LUTs?
 
-- **`exp_lut` depth = 16.** Covers integer `diff ∈ [0, 15]`. Beyond that, `e⁻¹⁵ ≈ 3 × 10⁻⁷`, which is below the Q6.10 LSB of 1/1024 ≈ 9.8 × 10⁻⁴, so the saturation clamp loses nothing. The clamp lives in the `lut_index` function in [`src/softmax_unit.v`](src/softmax_unit.v).
-- **`recip_lut` size = `N · 1024 + 1` = 3073 entries at N=3.** Sized to the max possible `row_sum`. For larger `N`, regenerate with `scripts/gen_luts.py --n <N>`.
+The exponent argument is Q.4 — integer part `i` and fraction `f` (sixteenths). Since
+`e^−(i + f/16) = e^−i · e^−(f/16)`, one 16-entry integer LUT and one 16-entry fraction LUT plus a Q1.10×Q1.10 multiply cover the full range at 1/16 resolution. The alternatives:
 
-### Error budget (measured)
+- **One direct LUT over Q4.4** would need 256 entries — 8× the ROM for identical accuracy.
+- **Integer-only exponents** (the obvious shortcut) quantize the argument to whole units of `e`: any two scores closer than 1.0 after scaling get *identical* attention weights. The two-LUT decomposition removes this failure mode for one extra multiply.
 
-The end-to-end error from `validate.py` on the committed input:
+### LUT dimensioning
 
-```
-Max error: 0.0049    Avg error: 0.0030
-```
+- **`exp_int_lut` depth 16**: beyond `e⁻¹⁵ ≈ 3×10⁻⁷` everything is below the Q.10 LSB (≈ 10⁻³), so the integer clamp at 15 is lossless.
+- **`exp_frac_lut` is always 2⁴ = 16 entries** — set by the 4 fractional bits of `S_scaled`.
+- **`recip_lut` is `N·1024 + 1` entries** (3073 at N=3) — sized to the maximum row sum. `scripts/gen_luts.py --n <N>` regenerates all three files.
 
-Where this error comes from (in descending magnitude):
+### Error budget
 
-1. **A's Q.8 quantization**: rounding `prob · 256` to integer ⇒ ±0.5 ULP = ±0.002 per A entry.
-2. **`exp_lut` integer-`d` quantization**: e.g. `e⁻³ = 0.04979`, stored as `51/1024 = 0.04980` — only ~0.0002 absolute. Negligible.
-3. **`recip_lut` floor**: at most 1 ULP in Q.20 ≈ 1 × 10⁻⁶, vanishing.
-4. **S_scaled = S >> 1**: 1-LSB loss on the score. Tiny influence since softmax is shift-invariant.
-5. **Output accumulator**: integer addition, no error.
+Measured across 185 randomized regression runs (5 configurations of N, D; small-magnitude and saturating inputs): **worst-case error vs fp32 = 0.67% of the output scale**; on the committed vector, max error 0.0039 with row 0 bit-identical to the rounded fp32 golden.
 
-The 0.005 max-error figure is dominated by source (1), the inherent ÷256 granularity of the A representation. To beat it we'd widen A to Q.10 or Q.12.
+Sources, in descending order:
+
+1. **A's Q.8 quantization**: ±0.5 ULP = ±0.002 per attention weight. The dominant term; output error ≈ `Σ |V|·ΔA` is therefore proportional to the output scale — which is why both checkers gate on `tol = abs_floor + 2% · max|O_expected|` rather than a fixed absolute number.
+2. **Exponent argument rounding**: `S_scaled` is rounded to 1/16, so each exp carries up to `e^(1/32) − 1 ≈ 3%` relative error; mostly common-mode (cancels in the softmax ratio).
+3. **exp LUT entry rounding**: ≤ 0.5/1024 per entry. Negligible.
+4. **`recip_lut` floor**: ≤ 1 ULP in Q.20. Vanishing.
 
 ### What we're *not* doing (and why)
 
-- **Polynomial / piecewise-linear `exp`.** Would cost more multipliers than a LUT for our `N`. Justified only when LUT size dominates area.
-- **Iterative division (Newton-Raphson).** Multi-cycle, more control state, no accuracy win at our precision.
-- **CORDIC `exp`.** Worth considering for larger `N` where the LUT grows. At `N=3`, the LUT wins on area.
+- **Polynomial / piecewise-linear `exp`**: more multipliers than two ROMs at this size.
+- **Iterative division (Newton-Raphson)**: multi-cycle, more control state, no accuracy win at Q.8 output precision.
+- **More fractional bits**: 4 bits already pushes the exp-argument error below the A-quantization floor; widening A (Q.10/Q.12) would have to come first.
 
 ---
 
 ## 4. Cycle-latency analysis
 
-Measured: `vvp sim/top_sim` reports `$finish at 2705 ns` at a 10 ns clock — **271 cycles** total. Breakdown:
+The matmul-style units (`matrix_multiply`, `score_unit`, `output_unit`) implement both a
+sequential datapath (one MAC, one product per cycle) and a parallel one
+(`PARALLEL=1`: all D or N products of a dot product in one cycle through an adder tree).
+Both are measured by the testbench (`Latency:` line) at `N=3, D=4`:
 
-| Stage | Cycles | Derivation |
-|---|---|---|
-| `IDLE → LOAD` | 1 | start-pulse handshake |
-| `LOAD` | 1 | `$readmemh` is zero-time in sim |
-| `PROJ` (3 parallel `matrix_multiply`) | ≈ 62 | per-element: D=4 compute + 1 store; N·D=12 outputs → `(D+1)·N·D = 60` + handshake |
-| `SCORE` (sequential `matrix_multiply`-style) | ≈ 47 | N·N=9 outputs, D-cycle accumulate + 1 store → `(D+1)·N² = 45` + handshake |
-| `SCALE` | 1 | combinational shift latched in one cycle |
-| `SOFTMAX` | ≈ 23 | 3 fixed + `2·N²` normalize (`NORMALIZE` + `NORM_STORE`) = `3 + 18` + handshakes |
-| `OUTPUT` | ≈ 124 | per O[i][j]: 3 cycles per term (LOAD/WAIT/ACC) × N + 1 store → `(3N+1)·N·D = 120` + handshakes |
-| `WRITE → DONE` | 1 | file write, zero-time in sim |
+| Stage | Sequential (cycles) | Parallel (cycles) | Derivation |
+|---|---|---|---|
+| `PROJ` (3 parallel `matrix_multiply`) | ≈ 61 | ≈ 13 | seq `(D+1)·N·D`; par `N·D` |
+| `SCORE` | ≈ 46 | ≈ 10 | seq `(D+1)·N²`; par `N²` |
+| `SCALE` | 2 | 2 | constant multiply, one register stage |
+| `SOFTMAX` | ≈ 31 | ≈ 31 | `2 + N²` exp + `2·N²` normalize + handshakes |
+| `OUTPUT` | ≈ 49 | ≈ 13 | seq `(N+1)·N·D`; par `N·D` |
+| handshakes / done | ≈ 8 | ≈ 8 | one start pulse + one done cycle per stage |
+| **Total (measured)** | **197** | **77** | reported by `top_level_tb` |
 
-Per-stage handshake overhead (start-pulse + done propagation) costs ~1–2 cycles per stage, accounting for the residual.
+The parallel datapath is **2.6× faster** end-to-end; the remaining time is dominated by the softmax, whose `NORMALIZE/NORM_STORE` pair could be pipelined to one element per cycle (a further ~9-cycle saving) at the cost of a second in-flight multiply.
 
-The dominant cost is `OUTPUT` (≈ 46 % of total), then `PROJ` (≈ 23 %). Three obvious wins, in order of effort:
-
-1. Collapse the `LOAD/WAIT/ACC` triad in `output_unit` to a single cycle by pre-registering operands and pipelining the multiply (saves ≈ 80 cycles).
-2. Share the `score_unit` accumulator across rows via banking (saves ≈ 20 cycles).
-3. Overlap `PROJ` with `LOAD` of the next batch in a streaming setup.
-
-None of these change the observable output — they're area/throughput trades.
+Each `start` is a single-cycle pulse and every FSM returns to `IDLE` after raising `done`, so back-to-back attention passes need no reset — the testbench runs the computation twice and checks the second pass is bit-identical.
 
 ---
 
-## 5. Trade-off matrix
+## 5. Synthesis results
 
-| Decision | Chose | Alternative | Why we chose it |
+The DUT contains no file I/O (the testbench owns all of it) and synthesizes with the
+open-source flow `sv2v` (SystemVerilog → Verilog-2005) + Yosys (`make synth`, `make synth_par`).
+Yosys 0.66, generic gate mapping via ABC, `N=3, D=4`:
+
+| Metric | Sequential | Parallel (`PARALLEL=1`) |
+|---|---|---|
+| Total cells | 20,678 | 30,948 (+50%) |
+| Flip-flops | 2,120 | 1,996 |
+| Longest topological path | 77 levels | 79 levels |
+
+Notes:
+
+- The **reciprocal ROM dominates the gate count** (3073 × 32 bits synthesized to logic in this generic flow); on an FPGA it maps to a single block RAM and the picture shifts heavily in the LUT approach's favor.
+- The parallel datapath buys its 2.6× cycle reduction with +50% combinational area at
+  essentially unchanged logic depth — the adder tree is shallower than the ABC-mapped
+  multiplier it feeds, so cycle time is not the casualty; area is.
+- `ltp` reports topological levels, not timing; a target-specific flow (e.g.
+  `synth_xilinx` + STA) would be the next step for real Fmax numbers.
+
+---
+
+## 6. Trade-off matrix
+
+| Decision | Chose | Alternative | Why |
 |---|---|---|---|
-| Number sys. | INT8 weights / INT16 intermediates | BF16, FP16, FP32 | Matches deployed ML quantization (post-training INT8). All-integer logic synthesises to LUTs/DSPs without FP cores. |
-| Softmax exp | 16-entry ROM | CORDIC / polynomial | Smallest area at our `N`; LUT is one BRAM read. |
-| Softmax divide | Reciprocal ROM + multiplier | Iterative divider | Single multiply, no extra FSM state. ROM cost is `N·1024` × 32-bit = 12 KB at N=3 (fits one BRAM). |
-| Architecture | Sequential FSM with handshakes | Systolic / fully pipelined | Clarity over throughput; 270 cycles for `(N=3, D=4)` is fine for a proof-of-concept; pipelining is documented as future work. |
-| `√dₖ` divide | Arithmetic right-shift | Multiply by reciprocal | At `dₖ=4`, `√dₖ=2` is a pure power-of-two — `>>>1` is exact. Doc'd for non-power cases. |
-| Parameterisation | `N`, `D`, `LUT_DEPTH` flow through every module | Hard-code N=3 (was the previous state) | Demonstrates we understand the scaling story; lets `gen_luts.py --n N` regenerate everything consistently. |
-| Verification | Self-checking RTL TB **+** fp32 NumPy ref | Either alone | Two independent checks catch different bugs: TB catches RTL regressions, `validate.py` catches Q-format drift. |
-
-
+| Number system | INT8 weights / integer intermediates, Q.4 scaled scores, Q.8 weights | BF16/FP16/FP32 | Matches post-training INT8 quantization; all-integer logic needs no FP cores. Fractional bits are introduced exactly where information is created (the 1/√d scale) and consumed (softmax). |
+| Softmax exp | Two 16-entry ROMs + 1 multiply | One 256-entry ROM; CORDIC; polynomial | 8× less ROM than the direct table at identical accuracy; far smaller than CORDIC/polynomial at this size. |
+| Softmax divide | Reciprocal ROM + multiplier | Iterative divider | Single multiply, no extra FSM state. ROM is `N·1024`×32 b (one BRAM at N=3). |
+| `1/√dₖ` | Constant multiply by `round(2¹²/√D)`, elaboration-time integer sqrt | Hard-coded shift | Exact for power-of-4 `D` (reduces to the shift), correct for every other `D`; keeps the design honestly parameterized. |
+| Multipliers | Behavioral `*` | Hand-built shift-add array | Synthesis infers DSP blocks / optimal gate multipliers; a manual array is strictly worse on every axis and obscures intent. |
+| Datapath | `PARALLEL` parameter: 1 MAC (area-min) or D-wide adder tree (2.6× faster, +50% area) | Fixed choice | Both design points are implemented, measured, and regression-tested — the sequential/parallel trade-off is data, not prose. |
+| Handshakes | Single-cycle start pulses; FSMs return to IDLE | Sticky start/done, reset between runs | Back-to-back passes with no reset; rerun verified bit-identical in the TB. |
+| File I/O | Testbench only; DUT is pure RTL | `$readmemh` inside the DUT | Keeps `top_level` synthesizable (proved via sv2v + Yosys). LUT ROM init via `$readmemh` in `initial` remains — the standard FPGA ROM-inference idiom. |
+| Verification | Self-checking TB + fp32 reference + **bit-accurate fixed-point model** + randomized regression + CI | Any subset | The fp32 model measures quantization error; the bit-accurate model catches *any* RTL deviation (exact equality, no tolerance to hide bugs); randomization covers the input contract; CI keeps it all green. |

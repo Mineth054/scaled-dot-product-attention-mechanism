@@ -1,6 +1,7 @@
 module output_unit #(
-    parameter N = 3,
-    parameter D = 4
+    parameter N        = 3,
+    parameter D        = 4,
+    parameter PARALLEL = 0  // 1: N multipliers + adder tree, one element/cycle
 )(
     input clk,
     input reset,
@@ -11,14 +12,12 @@ module output_unit #(
     output reg done
 );
 
-    localparam IDLE    = 3'd0;
-    localparam LOAD    = 3'd1;
-    localparam WAIT    = 3'd2;
-    localparam ACC     = 3'd3;
-    localparam STORE   = 3'd4;
-    localparam DONE_ST = 3'd5;
+    localparam IDLE    = 2'd0;
+    localparam COMPUTE = 2'd1;
+    localparam STORE   = 2'd2;
+    localparam DONE_ST = 2'd3;
 
-    reg [2:0] state;
+    reg [1:0] state;
 
     reg [$clog2(N)-1:0] i;
     reg [$clog2(D)-1:0] j;
@@ -26,15 +25,15 @@ module output_unit #(
 
     reg signed [31:0] acc;
 
-    reg  signed [15:0] mul_a;
-    reg  signed [15:0] mul_b;
-    wire signed [31:0] mul_result;
-
-    multiplier #(.WIDTH(16)) out_mul (
-        .a      (mul_a),
-        .b      (mul_b),
-        .result (mul_result)
-    );
+    // full weighted sum of the current (i, j); only used when PARALLEL=1.
+    // A is unsigned Q.8; zero-extend before the signed multiply.
+    integer kk;
+    reg signed [31:0] dot_cur;
+    always @(*) begin
+        dot_cur = 0;
+        for (kk = 0; kk < N; kk = kk + 1)
+            dot_cur = dot_cur + ($signed({1'b0, A[i][kk]}) * V[kk][j]);
+    end
 
     always @(posedge clk) begin
         if (reset) begin
@@ -44,8 +43,6 @@ module output_unit #(
             j     <= 0;
             k     <= 0;
             acc   <= 0;
-            mul_a <= 0;
-            mul_b <= 0;
         end else begin
             case (state)
 
@@ -56,34 +53,37 @@ module output_unit #(
                         j     <= 0;
                         k     <= 0;
                         acc   <= 0;
-                        state <= LOAD;
+                        state <= COMPUTE;
                     end
                 end
 
-                LOAD: begin
-                    mul_a <= $signed({1'b0, A[i][k]});
-                    mul_b <= V[k][j];
-                    state <= WAIT;
-                end
+                COMPUTE: begin
+                    if (PARALLEL) begin
+                        O[i][j] <= dot_cur;
 
-                WAIT: begin
-                    state <= ACC;
-                end
-
-                ACC: begin
-                    acc <= acc + mul_result;
-
-                    if (k == N-1) begin
-                        k     <= 0;
-                        state <= STORE;
+                        if (j == D-1) begin
+                            j <= 0;
+                            if (i == N-1)
+                                state <= DONE_ST;
+                            else
+                                i <= i + 1;
+                        end else begin
+                            j <= j + 1;
+                        end
                     end else begin
-                        k     <= k + 1;
-                        state <= LOAD;
+                        acc <= acc + ($signed({1'b0, A[i][k]}) * V[k][j]);
+
+                        if (k == N-1) begin
+                            k     <= 0;
+                            state <= STORE;
+                        end else begin
+                            k <= k + 1;
+                        end
                     end
                 end
 
                 STORE: begin
-                    // A is scaled by 256, divide in post-processing
+                    // A carries a x256 scale; divided out in post-processing
                     O[i][j] <= acc;
                     acc      <= 0;
 
@@ -93,16 +93,17 @@ module output_unit #(
                             state <= DONE_ST;
                         end else begin
                             i     <= i + 1;
-                            state <= LOAD;
+                            state <= COMPUTE;
                         end
                     end else begin
                         j     <= j + 1;
-                        state <= LOAD;
+                        state <= COMPUTE;
                     end
                 end
 
                 DONE_ST: begin
-                    done <= 1;
+                    done  <= 1;
+                    state <= IDLE;
                 end
 
             endcase

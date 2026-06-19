@@ -9,6 +9,8 @@ module matrix_multiply_tb;
     wire signed [15:0] Y [0:2][0:3];
     wire done;
 
+    reg signed [15:0] Y_exp [0:2][0:3];
+
     matrix_multiply #(.N(3), .D(4)) uut (
         .clk(clk),
         .reset(reset),
@@ -23,6 +25,7 @@ module matrix_multiply_tb;
     always #5 clk = ~clk;
 
     integer r, c;
+    integer errors;
 
     initial begin
         X[0][0]=1; X[0][1]=0; X[0][2]=1; X[0][3]=0;
@@ -33,6 +36,10 @@ module matrix_multiply_tb;
         W[1][0]= 0; W[1][1]= 1; W[1][2]= 0; W[1][3]= 1;
         W[2][0]= 1; W[2][1]= 0; W[2][2]=-1; W[2][3]= 0;
         W[3][0]= 0; W[3][1]= 1; W[3][2]= 0; W[3][3]=-1;
+
+        Y_exp[0][0]=2; Y_exp[0][1]=0; Y_exp[0][2]=0; Y_exp[0][3]=0;
+        Y_exp[1][0]=0; Y_exp[1][1]=2; Y_exp[1][2]=0; Y_exp[1][3]=0;
+        Y_exp[2][0]=1; Y_exp[2][1]=1; Y_exp[2][2]=1; Y_exp[2][3]=1;
 
         reset = 1;
         start = 0;
@@ -46,18 +53,23 @@ module matrix_multiply_tb;
         wait(done == 1);
         #10;
 
-        $display("Q matrix (should match Python output):");
+        errors = 0;
         for (r = 0; r < 3; r = r + 1) begin
-            $display("Row %0d: %4d %4d %4d %4d",
-                r, Y[r][0], Y[r][1], Y[r][2], Y[r][3]);
+            for (c = 0; c < 4; c = c + 1) begin
+                if (Y[r][c] !== Y_exp[r][c]) begin
+                    $display("FAIL: Y[%0d][%0d] = %0d, expected %0d",
+                             r, c, Y[r][c], Y_exp[r][c]);
+                    errors = errors + 1;
+                end
+            end
         end
 
-        $display("\nExpected:");
-        $display("Row 0:    2    0    0    0");
-        $display("Row 1:    0    2    0    0");
-        $display("Row 2:    1    1    1    1");
-
-        $finish;
+        if (errors == 0) begin
+            $display("matrix_multiply_tb PASS: all 12 elements match");
+            $finish;
+        end else begin
+            $fatal(1, "matrix_multiply_tb FAIL: %0d mismatches", errors);
+        end
     end
 
 endmodule

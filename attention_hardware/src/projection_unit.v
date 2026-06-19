@@ -1,6 +1,7 @@
 module projection_unit #(
-    parameter N = 3,
-    parameter D = 4
+    parameter N        = 3,
+    parameter D        = 4,
+    parameter PARALLEL = 0
 )(
     input clk,
     input reset,
@@ -18,7 +19,7 @@ module projection_unit #(
     wire done_q, done_k, done_v;
     assign done = done_q & done_k & done_v;
 
-    matrix_multiply #(.N(N), .D(D)) proj_q (
+    matrix_multiply #(.N(N), .D(D), .PARALLEL(PARALLEL)) proj_q (
         .clk(clk),
         .reset(reset),
         .start(start),
@@ -28,7 +29,7 @@ module projection_unit #(
         .done(done_q)
     );
 
-    matrix_multiply #(.N(N), .D(D)) proj_k (
+    matrix_multiply #(.N(N), .D(D), .PARALLEL(PARALLEL)) proj_k (
         .clk(clk),
         .reset(reset),
         .start(start),
@@ -38,7 +39,7 @@ module projection_unit #(
         .done(done_k)
     );
 
-    matrix_multiply #(.N(N), .D(D)) proj_v (
+    matrix_multiply #(.N(N), .D(D), .PARALLEL(PARALLEL)) proj_v (
         .clk(clk),
         .reset(reset),
         .start(start),

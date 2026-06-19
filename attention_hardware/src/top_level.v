@@ -1,26 +1,31 @@
+// Synthesizable attention core: softmax(X*WQ * (X*WK)^T / sqrt(D)) * (X*WV).
+// All file I/O lives in the testbench; inputs arrive on ports and the
+// result leaves on the O port. One start pulse runs one attention pass;
+// done holds high until the next start, and the FSM returns to IDLE so
+// back-to-back passes need no reset.
 module top_level #(
-    parameter N = 3,
-    parameter D = 4
+    parameter N        = 3,
+    parameter D        = 4,
+    parameter PARALLEL = 0  // 1: one dot product per cycle in the matmul units
 )(
     input clk,
     input reset,
     input start,
+    input  signed [7:0] X  [0:N-1][0:D-1],
+    input  signed [7:0] WQ [0:D-1][0:D-1],
+    input  signed [7:0] WK [0:D-1][0:D-1],
+    input  signed [7:0] WV [0:D-1][0:D-1],
+    output signed [31:0] O [0:N-1][0:D-1],  // x256 of the true output
     output reg done
 );
-
-    reg signed [7:0] X  [0:N-1][0:D-1];
-    reg signed [7:0] WQ [0:D-1][0:D-1];
-    reg signed [7:0] WK [0:D-1][0:D-1];
-    reg signed [7:0] WV [0:D-1][0:D-1];
 
     wire signed [15:0] Q [0:N-1][0:D-1];
     wire signed [15:0] K [0:N-1][0:D-1];
     wire signed [15:0] V [0:N-1][0:D-1];
 
     wire signed [31:0] S        [0:N-1][0:N-1];
-    wire signed [15:0] S_scaled [0:N-1][0:N-1];
+    wire signed [31:0] S_scaled [0:N-1][0:N-1];  // Q27.4
     wire        [15:0] A        [0:N-1][0:N-1];
-    wire signed [31:0] O        [0:N-1][0:D-1];
 
     reg proj_start, score_start, scale_start;
     reg softmax_start, output_start;
@@ -28,19 +33,17 @@ module top_level #(
     wire proj_done, score_done, scale_done;
     wire softmax_done, output_done;
 
-    localparam IDLE    = 4'd0;
-    localparam LOAD    = 4'd1;
-    localparam PROJ    = 4'd2;
-    localparam SCORE   = 4'd3;
-    localparam SCALE   = 4'd4;
-    localparam SOFTMAX = 4'd5;
-    localparam OUTPUT  = 4'd6;
-    localparam WRITE   = 4'd7;
-    localparam DONE_ST = 4'd8;
+    localparam IDLE    = 3'd0;
+    localparam PROJ    = 3'd1;
+    localparam SCORE   = 3'd2;
+    localparam SCALE   = 3'd3;
+    localparam SOFTMAX = 3'd4;
+    localparam OUTPUT  = 3'd5;
+    localparam DONE_ST = 3'd6;
 
-    reg [3:0] state;
+    reg [2:0] state;
 
-    projection_unit #(.N(N), .D(D)) proj (
+    projection_unit #(.N(N), .D(D), .PARALLEL(PARALLEL)) proj (
         .clk   (clk),
         .reset (reset),
         .start (proj_start),
@@ -54,7 +57,7 @@ module top_level #(
         .done  (proj_done)
     );
 
-    score_unit #(.N(N), .D(D)) score (
+    score_unit #(.N(N), .D(D), .PARALLEL(PARALLEL)) score (
         .clk   (clk),
         .reset (reset),
         .start (score_start),
@@ -64,7 +67,7 @@ module top_level #(
         .done  (score_done)
     );
 
-    scale_unit #(.N(N)) scale (
+    scale_unit #(.N(N), .D(D)) scale (
         .clk      (clk),
         .reset    (reset),
         .start    (scale_start),
@@ -82,7 +85,7 @@ module top_level #(
         .done     (softmax_done)
     );
 
-    output_unit #(.N(N), .D(D)) out (
+    output_unit #(.N(N), .D(D), .PARALLEL(PARALLEL)) out (
         .clk   (clk),
         .reset (reset),
         .start (output_start),
@@ -92,8 +95,7 @@ module top_level #(
         .done  (output_done)
     );
 
-    integer r, c;
-
+    // each *_start is a single-cycle pulse on the stage transition
     always @(posedge clk) begin
         if (reset) begin
             state         <= IDLE;
@@ -113,66 +115,49 @@ module top_level #(
             case (state)
 
                 IDLE: begin
-                    done <= 0;
-                    if (start)
-                        state <= LOAD;
-                end
-
-                LOAD: begin
-                    $readmemh("data/X.txt",  X);
-                    $readmemh("data/WQ.txt", WQ);
-                    $readmemh("data/WK.txt", WK);
-                    $readmemh("data/WV.txt", WV);
-                    state <= PROJ;
+                    if (start) begin
+                        done       <= 0;
+                        proj_start <= 1;
+                        state      <= PROJ;
+                    end
                 end
 
                 PROJ: begin
-                    proj_start <= 1;
-                    if (proj_done)
-                        state <= SCORE;
+                    if (proj_done) begin
+                        score_start <= 1;
+                        state       <= SCORE;
+                    end
                 end
 
                 SCORE: begin
-                    score_start <= 1;
-                    if (score_done)
-                        state <= SCALE;
+                    if (score_done) begin
+                        scale_start <= 1;
+                        state       <= SCALE;
+                    end
                 end
 
                 SCALE: begin
-                    scale_start <= 1;
-                    if (scale_done)
-                        state <= SOFTMAX;
+                    if (scale_done) begin
+                        softmax_start <= 1;
+                        state         <= SOFTMAX;
+                    end
                 end
 
                 SOFTMAX: begin
-                    softmax_start <= 1;
-                    if (softmax_done)
-                        state <= OUTPUT;
+                    if (softmax_done) begin
+                        output_start <= 1;
+                        state        <= OUTPUT;
+                    end
                 end
 
                 OUTPUT: begin
-                    output_start <= 1;
                     if (output_done)
-                        state <= WRITE;
-                end
-
-                WRITE: begin
-                    begin : write_block
-                        integer fp;
-                        fp = $fopen("data/output.txt", "w");
-                        for (r = 0; r < N; r = r + 1) begin
-                            for (c = 0; c < D; c = c + 1) begin
-                                $fwrite(fp, "%0d ", O[r][c]);
-                            end
-                            $fwrite(fp, "\n");
-                        end
-                        $fclose(fp);
-                    end
-                    state <= DONE_ST;
+                        state <= DONE_ST;
                 end
 
                 DONE_ST: begin
-                    done <= 1;
+                    done  <= 1;
+                    state <= IDLE;
                 end
 
             endcase

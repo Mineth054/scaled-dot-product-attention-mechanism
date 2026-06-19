@@ -14,6 +14,10 @@ module projection_unit_tb;
     wire signed [15:0] V [0:2][0:3];
     wire done;
 
+    reg signed [15:0] Q_exp [0:2][0:3];
+    reg signed [15:0] K_exp [0:2][0:3];
+    reg signed [15:0] V_exp [0:2][0:3];
+
     projection_unit #(.N(3), .D(4)) uut (
         .clk(clk),
         .reset(reset),
@@ -32,6 +36,7 @@ module projection_unit_tb;
     always #5 clk = ~clk;
 
     integer r, c;
+    integer errors;
 
     initial begin
         X[0][0]=1; X[0][1]=0; X[0][2]=1; X[0][3]=0;
@@ -53,6 +58,18 @@ module projection_unit_tb;
         WV[2][0]= 1; WV[2][1]= 0; WV[2][2]= 0; WV[2][3]=-1;
         WV[3][0]= 0; WV[3][1]= 1; WV[3][2]=-1; WV[3][3]= 0;
 
+        Q_exp[0][0]=2; Q_exp[0][1]=0; Q_exp[0][2]=0; Q_exp[0][3]=0;
+        Q_exp[1][0]=0; Q_exp[1][1]=2; Q_exp[1][2]=0; Q_exp[1][3]=0;
+        Q_exp[2][0]=1; Q_exp[2][1]=1; Q_exp[2][2]=1; Q_exp[2][3]=1;
+
+        K_exp[0][0]=0; K_exp[0][1]=0; K_exp[0][2]=0; K_exp[0][3]=2;
+        K_exp[1][0]=2; K_exp[1][1]=0; K_exp[1][2]=0; K_exp[1][3]=0;
+        K_exp[2][0]=1; K_exp[2][1]=1; K_exp[2][2]=1; K_exp[2][3]=1;
+
+        V_exp[0][0]=2; V_exp[0][1]=0; V_exp[0][2]=0; V_exp[0][3]=0;
+        V_exp[1][0]=0; V_exp[1][1]=2; V_exp[1][2]=0; V_exp[1][3]=0;
+        V_exp[2][0]=1; V_exp[2][1]=1; V_exp[2][2]=1; V_exp[2][3]=1;
+
         reset = 1; start = 0;
         @(posedge clk); #1;
         reset = 0;
@@ -64,37 +81,33 @@ module projection_unit_tb;
         wait(done == 1);
         #10;
 
-        $display("=== Q matrix ===");
-        for (r = 0; r < 3; r = r + 1)
-            $display("Row %0d: %4d %4d %4d %4d",
-                r, Q[r][0], Q[r][1], Q[r][2], Q[r][3]);
+        errors = 0;
+        for (r = 0; r < 3; r = r + 1) begin
+            for (c = 0; c < 4; c = c + 1) begin
+                if (Q[r][c] !== Q_exp[r][c]) begin
+                    $display("FAIL: Q[%0d][%0d] = %0d, expected %0d",
+                             r, c, Q[r][c], Q_exp[r][c]);
+                    errors = errors + 1;
+                end
+                if (K[r][c] !== K_exp[r][c]) begin
+                    $display("FAIL: K[%0d][%0d] = %0d, expected %0d",
+                             r, c, K[r][c], K_exp[r][c]);
+                    errors = errors + 1;
+                end
+                if (V[r][c] !== V_exp[r][c]) begin
+                    $display("FAIL: V[%0d][%0d] = %0d, expected %0d",
+                             r, c, V[r][c], V_exp[r][c]);
+                    errors = errors + 1;
+                end
+            end
+        end
 
-        $display("\nExpected Q:");
-        $display("Row 0:    2    0    0    0");
-        $display("Row 1:    0    2    0    0");
-        $display("Row 2:    1    1    1    1");
-
-        $display("\n=== K matrix ===");
-        for (r = 0; r < 3; r = r + 1)
-            $display("Row %0d: %4d %4d %4d %4d",
-                r, K[r][0], K[r][1], K[r][2], K[r][3]);
-
-        $display("\nExpected K:");
-        $display("Row 0:    0    0    0    2");
-        $display("Row 1:    2    0    0    0");
-        $display("Row 2:    1    1    1    1");
-
-        $display("\n=== V matrix ===");
-        for (r = 0; r < 3; r = r + 1)
-            $display("Row %0d: %4d %4d %4d %4d",
-                r, V[r][0], V[r][1], V[r][2], V[r][3]);
-
-        $display("\nExpected V:");
-        $display("Row 0:    2    0    0    0");
-        $display("Row 1:    0    2    0    0");
-        $display("Row 2:    1    1    1    1");
-
-        $finish;
+        if (errors == 0) begin
+            $display("projection_unit_tb PASS: all 36 elements match");
+            $finish;
+        end else begin
+            $fatal(1, "projection_unit_tb FAIL: %0d mismatches", errors);
+        end
     end
 
 endmodule

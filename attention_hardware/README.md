@@ -6,43 +6,39 @@ A fixed-point Verilog implementation of single-head scaled dot-product attention
 Attention(Q, K, V) = softmax(Q · Kᵀ / √dₖ) · V
 ```
 
-Built for the ArchLabX task 26 brief. Targets Icarus Verilog (open-source), runs an end-to-end self-checking simulation, and is cross-validated against an fp32 NumPy reference with per-element error reporting.
+Built for the ArchLabX task 26 brief. Targets Icarus Verilog (open-source), runs an end-to-end self-checking simulation, is cross-validated against **both** an fp32 NumPy reference and a **bit-accurate fixed-point model** (exact-equality check, randomized regression), and synthesizes with the open-source sv2v + Yosys flow.
 
-See [`DESIGN.md`](DESIGN.md) for the detailed Q-format derivation, numerical worked example, softmax justification, and design trade-offs.
+See [`DESIGN.md`](DESIGN.md) for the Q-format derivation, numerical worked example, softmax justification, measured latency/area trade-offs, and synthesis results.
 
 ---
 
 ## Architecture
 
 ```
-                ┌─────────────────────── top_level FSM ───────────────────────┐
-                │  IDLE → LOAD → PROJ → SCORE → SCALE → SOFTMAX → OUTPUT →   │
-                │                                                    WRITE   │
-                └─────────────────────────────────────────────────────────────┘
+   tb/top_level_tb.v ── owns ALL file I/O ($readmemh in, $fwrite out)
+        │  X, WQ, WK, WV (ports)
+        ▼
+   ┌──────────────────────── top_level FSM (synthesizable) ────────────────────┐
+   │      IDLE → PROJ → SCORE → SCALE → SOFTMAX → OUTPUT → DONE → IDLE        │
+   │      (single-cycle start pulses; back-to-back runs need no reset)        │
+   └───────────────────────────────────────────────────────────────────────────┘
 
-   data/X.txt ─┐
-   data/WQ.txt├─► projection_unit ──► Q,K,V  (N×D, signed Q15.0)
-   data/WK.txt│   (3× matrix_multiply)
-   data/WV.txt┘                      │
-                                     ▼
-                          score_unit   S = Q·Kᵀ      (N×N, signed Q31.0)
-                                     │
-                                     ▼
-                          scale_unit   S_scaled = S ≫ 1   (signed Q15.0)
-                                     │
-                                     ▼
-                          softmax_unit A = softmax(S_scaled)
-                                       │              (unsigned, scaled ×256)
-                                       │   exp LUT (16 entries, e⁻ᵈ·2¹⁰)
-                                       │   recip LUT (3073 entries, 2²⁰/Σ)
-                                     ▼
-                          output_unit  O = A·V         (signed Q31.0, ×256)
-                                     │
-                                     ▼
-                          data/output.txt   +   sim/attention.vcd
+   projection_unit ──► Q,K,V   (N×D, signed Q15.0)     3× matrix_multiply
+        │
+   score_unit      ──► S = Q·Kᵀ        (N×N, signed Q31.0)
+        │
+   scale_unit      ──► S_scaled = round(S·2⁴/√dₖ)      (signed Q27.4)
+        │              constant mult by round(2¹²/√D), any D
+   softmax_unit    ──► A = softmax(S_scaled)           (unsigned Q.8, prob×256)
+        │              e^-(i+f) = exp_int_lut[i] · exp_frac_lut[f]  (two Q1.10 ROMs)
+        │              divide via recip ROM: floor(2²⁰/Σ)
+   output_unit     ──► O = A·V                         (signed 32-bit, ×256)
+        │
+        ▼
+   data/output.txt   +   sim/attention.vcd
 ```
 
-All bit widths are listed in [`DESIGN.md`](DESIGN.md#fixed-point-format-chain).
+The matmul-style units implement **two datapaths** selected by the `PARALLEL` parameter: sequential (one MAC, area-minimal) and parallel (full dot product per cycle through an adder tree). Measured at `N=3, D=4`: **197 cycles sequential, 77 cycles parallel** (2.6×, +50% cell area — see [`DESIGN.md`](DESIGN.md#5-synthesis-results)).
 
 ---
 
@@ -50,28 +46,28 @@ All bit widths are listed in [`DESIGN.md`](DESIGN.md#fixed-point-format-chain).
 
 ```
 attention_hardware/
-├── src/                 RTL modules (Verilog-2001/2012)
-│   ├── top_level.v          FSM orchestrator
+├── src/                 RTL (synthesizable; no file I/O)
+│   ├── top_level.v          FSM orchestrator, data in/out via ports
 │   ├── projection_unit.v    3× parallel Q,K,V projection
-│   ├── matrix_multiply.v    sequential dot-product MAC
-│   ├── score_unit.v         Q·Kᵀ
-│   ├── scale_unit.v         arithmetic right-shift by 1 (÷√dₖ for dₖ=4)
-│   ├── softmax_unit.v       max-subtract + exp LUT + reciprocal LUT
-│   ├── output_unit.v        A·V weighted sum
-│   ├── mac_unit.v           shared MAC primitive
-│   ├── multiplier.v         parameterized signed multiplier
-│   └── unsigned_multiplier.v 16×32 unsigned multiplier (softmax normalize)
-├── tb/                  Testbenches (one per src/*.v + top_level integration)
-├── data/                Inputs (X, WQ, WK, WV), LUTs, golden vector, output
+│   ├── matrix_multiply.v    X·W (sequential MAC or PARALLEL adder tree)
+│   ├── score_unit.v         Q·Kᵀ (same two datapaths)
+│   ├── scale_unit.v         ×round(2¹²/√D) — elaboration-time integer sqrt
+│   ├── softmax_unit.v       max-subtract + two-LUT exp + reciprocal LUT
+│   └── output_unit.v        A·V weighted sum (same two datapaths)
+├── tb/                  Self-checking testbenches (one per module + integration)
+├── data/                Inputs (X, WQ/WK/WV), LUTs, golden vector, output
 ├── scripts/
-│   ├── gen_luts.py          regenerate data/recip_lut.txt (and emit exp LUT)
-│   └── gen_golden.py        regenerate data/O_expected.txt from Python ref
-├── sim/                 build artefacts (top_sim, attention.vcd, *_sim)
-├── validate.py          fp32 NumPy reference vs hardware (5% tolerance)
-├── Makefile             one-shot build / run / validate
+│   ├── gen_luts.py          regenerate the three softmax LUT files
+│   ├── gen_golden.py        regenerate data/O_expected.txt (fp32 reference)
+│   ├── fixed_model.py       bit-accurate Python model of the RTL
+│   └── regress.py           randomized regression: RTL vs model, exact match
+├── validate.py          fp32 NumPy reference vs hardware output
+├── Makefile             build / run / validate / regress / synth
 ├── run.ps1              Windows equivalent (no GNU make required)
 └── DESIGN.md            full design walkthrough
 ```
+
+CI (`.github/workflows/ci.yml`) runs the full flow on every push: end-to-end test, randomized regression across five (N, D) configurations plus the parallel datapath, Verilator lint, and Yosys synthesis of both datapaths.
 
 ---
 
@@ -80,8 +76,8 @@ attention_hardware/
 ### Prerequisites
 - **Icarus Verilog ≥ 11** (`iverilog`, `vvp`)
 - **Python ≥ 3.9** with **NumPy**
-- *(optional)* GTKWave for `sim/attention.vcd`
-- *(optional)* GNU `make`
+- *(optional)* **sv2v** + **yowasp-yosys** (`pip install yowasp-yosys`) for `make synth`
+- *(optional)* GTKWave for `sim/attention.vcd`, GNU `make`
 
 ### One command
 
@@ -95,83 +91,83 @@ On Windows without GNU make:
 .\run.ps1          # equivalent
 ```
 
-### Step by step
+### All targets
 
 ```bash
 make build         # iverilog → sim/top_sim
 make run           # vvp sim/top_sim → data/output.txt + sim/attention.vcd
-make validate      # python validate.py against fp32 golden
-make luts          # regenerate data/recip_lut.txt and data/O_expected.txt
+make validate      # python validate.py against the fp32 reference
+make regress       # randomized regression vs the bit-accurate model (seq + parallel)
+make synth         # sv2v + Yosys: cell counts + logic depth (sequential)
+make synth_par     # same for the PARALLEL=1 datapath
+make luts          # regenerate LUT files + golden vector
 make wave          # gtkwave sim/attention.vcd
 make clean         # remove sim binaries + generated output
 ```
 
-Per-module testbenches:
+Per-module testbenches: `make mm_sim proj_sim score_sim scale_sim softmax_sim out_sim`
 
-```bash
-make mac_sim mul_sim mm_sim proj_sim score_sim scale_sim softmax_sim out_sim
-```
+Compile-time configuration (testbench defines): `iverilog -g2012 -DN=4 -DD=8 -DPARALLEL=1 ...`, or `python scripts/regress.py --n 4 --d 8 --parallel`.
 
 ---
 
 ## Expected output
 
-`vvp sim/top_sim` runs the self-checking testbench in [`tb/top_level_tb.v`](tb/top_level_tb.v) and compares hardware output against [`data/O_expected.txt`](data/O_expected.txt) (generated by [`scripts/gen_golden.py`](scripts/gen_golden.py) from the fp32 Python reference). Tolerance is ±32 raw units (= 0.125 in normalized space).
+`vvp sim/top_sim` runs the self-checking testbench in [`tb/top_level_tb.v`](tb/top_level_tb.v): it loads the inputs, runs the attention pass **twice back-to-back** (verifying no-reset reruns are bit-identical), reports latency, and compares against [`data/O_expected.txt`](data/O_expected.txt). The tolerance is scale-proportional — `32 + 2% of max|O_expected|` raw units — because A's ±1 LSB (1/256) quantization error multiplies V, making output error proportional to output magnitude.
 
 ```
-=== Attention RTL output vs golden (tolerance = +/-32 raw units) ===
-  O[0][0]: got=108 expected=109 diff=1  PASS
-  O[0][1]: got=402 expected=403 diff=1  PASS
+=== Attention RTL output vs golden (tol = 32 + 2% of max|O| = 40) ===
+  O[0][0]: got=109 expected=109 diff=0  PASS
   ...
-=== PASS: all 12 outputs within tolerance ===
+Latency: 197 cycles (N=3, D=4, PARALLEL=0)
+=== PASS: all 12 outputs within tolerance, rerun bit-identical ===
 ```
 
-`python validate.py` then verifies the same output in normalized fp32 space:
+`python validate.py` checks the same output in normalized fp32 space:
 
 ```
-=== Comparison ===
-Max error:  0.0049
-Avg error:  0.0030
- PASS - all values within 5% of golden model
+Max error:  0.0039
+ PASS - max error 0.0039 within tol 0.0515 (0.02 + 2% of max|O|)
+```
+
+`python scripts/regress.py --runs 20 --range 3` drives random inputs and requires the RTL to match the bit-accurate model **exactly**:
+
+```
+run   0: exact, fp32 err 0.08% of output scale
+...
+bit-exact vs fixed model: 20/20
+PASS
 ```
 
 ---
 
 ## Module reference
 
-| Module | Parameters | Purpose | Latency (cycles) |
+| Module | Parameters | Purpose | Latency (cycles, seq / par) |
 |---|---|---|---|
-| `top_level` | `N=3, D=4` | 9-state FSM orchestrating the dataflow | sum of stages ≈ 270 |
-| `projection_unit` | `N, D` | 3 parallel `matrix_multiply` instances for Q, K, V | `(D+1)·N·D` ≈ 60 |
-| `matrix_multiply` | `N, D` | Sequential `N·D` dot products, accumulator per element | `(D+1)·N·D` |
-| `score_unit` | `N, D` | `Q · Kᵀ`, sequential dot products | `(D+1)·N²` ≈ 45 |
-| `scale_unit` | `N` | Arithmetic right-shift by 1 (÷√dₖ for dₖ=4) | 1 |
-| `softmax_unit` | `N, LUT_DEPTH=16` | Max-subtract, exp LUT, reciprocal LUT, normalize | `4 + 2·N²` ≈ 22 |
-| `output_unit` | `N, D` | `A · V` via shared signed multiplier | `(3N+1)·N·D` ≈ 120 |
-| `multiplier` | `WIDTH=8` | Parameterized signed multiplier (sign-magnitude) | combinational |
-| `unsigned_multiplier` | `WIDTHA=16, WIDTHB=32` | Used inside softmax for the normalize divide | combinational |
-| `mac_unit` | — | Pipelined MAC primitive (multiply then accumulate) | 1 |
-
-Measured: total elapsed time in `sim/top_sim` is 2705 ns at a 10 ns clock period, so the full attention computation completes in **≈ 270 cycles** for `N=3, D=4`.
-
-See [`DESIGN.md`](DESIGN.md) for the cycle-count derivation, fixed-point precision analysis, and softmax error budget.
+| `top_level` | `N, D, PARALLEL` | 7-state FSM; one start pulse per pass, no reset between runs | 197 / 77 measured |
+| `projection_unit` | `N, D, PARALLEL` | 3 parallel `matrix_multiply` for Q, K, V | `(D+1)·N·D` / `N·D` |
+| `matrix_multiply` | `N, D, PARALLEL` | X·W; sequential MAC or D-wide adder tree | `(D+1)·N·D` / `N·D` |
+| `score_unit` | `N, D, PARALLEL` | `Q·Kᵀ` | `(D+1)·N²` / `N²` |
+| `scale_unit` | `N, D, FRAC, RSHIFT` | `round(S·2⁴/√D)`, constant multiply | 1 |
+| `softmax_unit` | `N, FRAC, LUT_DEPTH` | max-subtract, two-LUT exp, reciprocal LUT, rounded normalize | `2 + 3·N²` |
+| `output_unit` | `N, D, PARALLEL` | `A·V` | `(N+1)·N·D` / `N·D` |
 
 ---
 
 ## Verification approach
 
-Two layers:
+Three independent layers, all wired into `make`/CI:
 
-1. **Self-checking RTL testbench** ([`tb/top_level_tb.v`](tb/top_level_tb.v)). Reads expected outputs via `$readmemh` and prints `PASS`/`FAIL` per element, exits non-zero on failure. Drives `make test` end-to-end.
-2. **fp32 NumPy reference** ([`validate.py`](validate.py)). Recomputes the full attention in floating point, compares against the hardware output divided by 256, reports max / average / per-element error with a 5% tolerance gate.
-
-Per-module testbenches in `tb/*.v` exercise each block in isolation with directed vectors and printed-comparison expected outputs. They are wired into the Makefile as individual targets.
+1. **Self-checking RTL testbench** ([`tb/top_level_tb.v`](tb/top_level_tb.v)): golden-vector compare with scale-proportional tolerance, latency report, bit-identical rerun check. Exits non-zero on failure. Every per-module testbench in `tb/` is also self-checking (`$fatal` on mismatch).
+2. **Bit-accurate fixed-point model** ([`scripts/fixed_model.py`](scripts/fixed_model.py)) + **randomized regression** ([`scripts/regress.py`](scripts/regress.py)): mirrors every LUT, rounding and bit-slice of the RTL, so hardware output is checked for *exact equality* — no tolerance to hide bugs. 185 randomized runs across `(N,D) ∈ {(3,4),(4,8),(8,8),(6,5)}`, both datapaths, small-magnitude and saturating inputs: all bit-exact; worst fp32 quantization error 0.67% of output scale.
+3. **fp32 NumPy reference** ([`validate.py`](validate.py)): quantifies the fixed-point error against real attention.
 
 ---
 
 ## Notes on the design
 
-- **Fixed-point throughout**: 8-bit signed weights/embeddings, 16-bit projections, 32-bit accumulators. No floating-point synthesised.
-- **Softmax approximation**: max-subtraction for numerical stability, a 16-entry `e⁻ᵈ` LUT scaled by 1024, and a 3073-entry reciprocal LUT for the divide. End-to-end max error vs fp32: 0.0049.
-- **Parameterised**: `N` (sequence length) and `D` (head dim) flow through every module; the softmax reductions are now true `for`-loops rather than hardcoded N=3 unrolls.
-- **Single-shot FSM**: one start pulse per attention pass; needs a reset to re-run. Documented as a deliberate proof-of-concept choice in [`DESIGN.md`](DESIGN.md#future-work).
+- **Fixed-point throughout**: INT8 inputs, integer projections/scores, Q27.4 scaled scores, Q.8 attention weights. The fractional bits are introduced exactly where the math creates them (the 1/√dₖ scale) — see the format chain in [`DESIGN.md`](DESIGN.md#2-fixed-point-format-chain).
+- **Softmax**: max-subtraction for stability, `e^-(i+f) = e⁻ⁱ·e⁻ᶠ` via two 16-entry Q1.10 ROMs and one multiply (1/16-resolution exponents), reciprocal-ROM divide, round-to-nearest at every truncation.
+- **Parameterized and proved**: `N`, `D`, `PARALLEL` flow through every module; CI regression-tests five (N, D) configurations including non-power-of-two.
+- **Synthesizable**: the DUT has no file I/O; `make synth` runs sv2v + Yosys and reports cell counts and logic depth for both datapaths ([`DESIGN.md`](DESIGN.md#5-synthesis-results)).

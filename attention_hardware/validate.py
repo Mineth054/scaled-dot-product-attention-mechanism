@@ -59,14 +59,18 @@ print("\n=== Comparison ===")
 print(f"Max error:  {max_error:.4f}")
 print(f"Avg error:  {avg_error:.4f}")
 
-THRESHOLD_ABS = 0.125
-THRESHOLD_PCT = 0.01
-rel_diff = diff / (np.abs(O_expected) + 1e-9)
-passed = np.max(diff) < THRESHOLD_ABS or np.max(rel_diff) < THRESHOLD_PCT
+# A carries +/-1 LSB (1/256) quantization error per attention weight, so
+# the output error budget is proportional to the output scale: a fixed
+# absolute floor plus a percentage of max|O_expected|.
+THRESHOLD_ABS = 0.02
+THRESHOLD_PCT = 0.02
+tol = THRESHOLD_ABS + THRESHOLD_PCT * np.max(np.abs(O_expected))
+passed = max_error <= tol
 if passed:
-    print(f"\n PASS - all values within abs<={THRESHOLD_ABS} or rel<={THRESHOLD_PCT*100:.0f}%")
+    print(f"\n PASS - max error {max_error:.4f} within tol {tol:.4f} "
+          f"({THRESHOLD_ABS} + {THRESHOLD_PCT*100:.0f}% of max|O|)")
 else:
-    print(f"\n FAIL - max abs error {max_error:.4f}, max rel error {np.max(rel_diff):.4f}")
+    print(f"\n FAIL - max error {max_error:.4f} exceeds tol {tol:.4f}")
 
 print("\n=== Per Element Error ===")
 N, D = O_expected.shape
@@ -75,7 +79,8 @@ for r in range(N):
         exp = O_expected[r][c]
         got = O_hardware[r][c]
         err = abs(exp - got)
-        err_rel = err / (abs(exp) + 1e-9)
-        status = "PASS" if (err < THRESHOLD_ABS or err_rel < THRESHOLD_PCT) else "FAIL"
+        status = "PASS" if err <= tol else "FAIL"
         print(f"O[{r}][{c}]: expected={exp:.4f}  got={got:.4f}  "
-              f"err={err:.4f} ({err_rel*100:.2f}%)  {status}")
+              f"err={err:.4f}  {status}")
+
+sys.exit(0 if passed else 1)

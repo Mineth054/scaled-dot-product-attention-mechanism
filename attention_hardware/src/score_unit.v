@@ -1,6 +1,7 @@
 module score_unit #(
-    parameter N = 3,
-    parameter D = 4
+    parameter N        = 3,
+    parameter D        = 4,
+    parameter PARALLEL = 0  // 1: D multipliers + adder tree, one element/cycle
 )(
     input clk,
     input reset,
@@ -23,6 +24,15 @@ module score_unit #(
     reg [$clog2(D)-1:0] k;
 
     reg signed [31:0] acc;
+
+    // full dot product of the current (i, j); only used when PARALLEL=1
+    integer kk;
+    reg signed [31:0] dot_cur;
+    always @(*) begin
+        dot_cur = 0;
+        for (kk = 0; kk < D; kk = kk + 1)
+            dot_cur = dot_cur + (Q[i][kk] * K[j][kk]);
+    end
 
     always @(posedge clk) begin
         if (reset) begin
@@ -47,13 +57,27 @@ module score_unit #(
                 end
 
                 COMPUTE: begin
-                    acc <= acc + (Q[i][k] * K[j][k]);
+                    if (PARALLEL) begin
+                        S[i][j] <= dot_cur;
 
-                    if (k == D-1) begin
-                        k     <= 0;
-                        state <= STORE;
+                        if (j == N-1) begin
+                            j <= 0;
+                            if (i == N-1)
+                                state <= DONE_ST;
+                            else
+                                i <= i + 1;
+                        end else begin
+                            j <= j + 1;
+                        end
                     end else begin
-                        k <= k + 1;
+                        acc <= acc + (Q[i][k] * K[j][k]);
+
+                        if (k == D-1) begin
+                            k     <= 0;
+                            state <= STORE;
+                        end else begin
+                            k <= k + 1;
+                        end
                     end
                 end
 
@@ -76,7 +100,8 @@ module score_unit #(
                 end
 
                 DONE_ST: begin
-                    done <= 1;
+                    done  <= 1;
+                    state <= IDLE;
                 end
 
             endcase

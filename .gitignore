@@ -7,6 +7,12 @@ attention_hardware/sim/softmax_tb
 # VCD waveform dump (can be large; regenerate with: make run)
 attention_hardware/sim/*.vcd
 
+# Synthesis intermediates (regenerate with: make synth)
+attention_hardware/sim/design_flat.v
+attention_hardware/sim/*.log
+attention_hardware/sim/top_sim_par
+attention_hardware/sim/regress_*
+
 # Simulation output (regenerate with: make run)
 attention_hardware/data/output.txt
 

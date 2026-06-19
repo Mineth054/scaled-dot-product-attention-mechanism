@@ -1,0 +1,61 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: attention_hardware
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Icarus Verilog and Verilator
+        run: sudo apt-get update && sudo apt-get install -y iverilog verilator
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install Python dependencies
+        run: pip install numpy
+
+      - name: Build, simulate, validate (committed vectors)
+        run: make test
+
+      - name: Randomized regression (small magnitudes, fractional softmax)
+        run: python scripts/regress.py --runs 20 --range 3
+
+      - name: Randomized regression (saturation)
+        run: python scripts/regress.py --runs 10 --range 16 --seed 1
+
+      - name: Parameter sweep N=4 D=8
+        run: python scripts/regress.py --runs 10 --n 4 --d 8 --range 3
+
+      - name: Parameter sweep N=8 D=8
+        run: python scripts/regress.py --runs 10 --n 8 --d 8 --range 2 --seed 3
+
+      - name: Parameter sweep N=6 D=5 (non-power-of-two)
+        run: python scripts/regress.py --runs 10 --n 6 --d 5 --range 3 --seed 11
+
+      - name: Randomized regression (parallel datapath)
+        run: python scripts/regress.py --runs 20 --range 3 --parallel
+
+      - name: Lint (Verilator)
+        run: verilator --lint-only -Wno-fatal --top-module top_level src/*.v
+
+      - name: Install sv2v and Yosys
+        run: |
+          wget -q https://github.com/zachjs/sv2v/releases/latest/download/sv2v-Linux.zip
+          unzip -q sv2v-Linux.zip
+          echo "$PWD/sv2v-Linux" >> "$GITHUB_PATH"
+          pip install yowasp-yosys
+
+      - name: Synthesis (sequential)
+        run: make synth
+
+      - name: Synthesis (parallel datapath)
+        run: make synth_par
